@@ -1,0 +1,20 @@
+services:
+  lixo-bot:
+    build: .
+    image: lixo-bot:local
+    container_name: lixo-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # dentro do container precisa escutar em 0.0.0.0; a exposicao no host continua so em 127.0.0.1
+      ADMIN_HOST: 0.0.0.0
+      DATA_DIR: /app/data
+    ports:
+      - "127.0.0.1:${ADMIN_PORT:-3000}:${ADMIN_PORT:-3000}"
+    volumes:
+      # volume nomeado: ja nasce com dono correto (usuario node, uid 1000).
+      # Para usar pasta do host: troque por ./data:/app/data e rode antes `sudo chown -R 1000:1000 data`.
+      - lixo-data:/app/data
+
+volumes:
+  lixo-data:
