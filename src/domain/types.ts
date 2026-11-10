@@ -14,17 +14,14 @@ export interface Participant {
   telegramUsername: string | null;
   /** Nome no Telegram, apenas para exibição. */
   telegramName: string | null;
+  /** Saldo de turnos (define a fila). Pode ser negativo. */
+  balance: number;
+  /** Distância para a moda guardada ao sair de férias (só para quem está de férias). */
+  vacationOffset: number | null;
 }
 
 /** Situação do chat privado com o bot (necessário para o lembrete da véspera). */
 export type PrivateChatStatus = 'ok' | 'bloqueado' | 'desconhecido';
-
-export interface PointValues {
-  ownTurn: number;
-  cover: number;
-  covered: number;
-  reportedAbsence: number;
-}
 
 export interface Settings {
   activeWeekdays: Weekday[];
@@ -35,7 +32,6 @@ export interface Settings {
   reminderTime: string; // HH:MM
   endOfDayTime: string; // HH:MM
   lateCallGraceMinutes: number;
-  points: PointValues;
   groupId: string | null;
   groupName: string | null;
 }
@@ -49,7 +45,6 @@ export const DEFAULT_SETTINGS: Settings = {
   reminderTime: '18:00',
   endOfDayTime: '23:59',
   lateCallGraceMinutes: 30,
-  points: { ownTurn: 1, cover: 3, covered: 0, reportedAbsence: -1 },
   groupId: null,
   groupName: null,
 };
@@ -75,6 +70,8 @@ export interface DayRecord {
   /** Mensagem da chamada de cobertura (botão Eu pego). */
   callChatId: string | null;
   callMessageId: number | null;
+  /** Quem recebeu o +1 de saldo por este dia (deve ser quem efetivamente ficou com ele). */
+  creditedId: number | null;
 }
 
 export type CoverageMode = 'voluntario' | 'automatico';
@@ -90,15 +87,36 @@ export interface Coverage {
   createdAt: string;
 }
 
-export type PointKind = 'turno' | 'cobertura' | 'coberto' | 'falta' | 'ajuste';
+export type BalanceKind =
+  | 'dia' // +1: ficou com o dia
+  | 'dia_estorno' // -1: o dia passou para outra pessoa (ou foi desfeito)
+  | 'ajuste' // manual, com motivo
+  | 'nivelamento' // subtração da moda
+  | 'entrada' // participante novo (saldo 0)
+  | 'reativacao' // volta de desligado (saldo 0)
+  | 'ferias_saida' // offset guardado (delta 0)
+  | 'ferias_volta' // saldo = offset guardado
+  | 'ferias_descartado' // férias -> desligado: offset descartado
+  | 'migracao';
 
-export interface PointEntry {
+export interface BalanceEntry {
   id: number;
   participantId: number;
   refDate: ISODate;
   delta: number;
-  kind: PointKind;
+  balanceAfter: number;
+  kind: BalanceKind;
   reason: string;
   actor: string;
   createdAt: string;
+}
+
+export interface RebaseRecord {
+  id: number;
+  ts: string;
+  refDate: ISODate;
+  mode: number;
+  reason: string;
+  actor: string;
+  detail: { name: string; before: number; after: number }[];
 }

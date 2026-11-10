@@ -1,5 +1,5 @@
 /**
- * Orquestra as regras de negócio: escala, chamadas de cobertura, pontuação,
+ * Orquestra as regras de negócio: escala por saldo de turnos, chamadas de cobertura,
  * comandos, botões e tarefas agendadas. Não conhece o Telegram, só `Messenger`.
  *
  * Toda validação acontece aqui. Comandos de texto e botões passam pelas mesmas
@@ -25,6 +25,7 @@ import {
   isActiveDay,
   localNow,
   monthKey,
+  monthLabel,
   nextActiveDays,
   parseHHMM,
   previousMonthKey,
@@ -32,8 +33,9 @@ import {
 } from './dates.js';
 import * as msg from './messages.js';
 import { escapeHtml } from './messages.js';
-import { nextInQueue, predict, sortQueue } from './rotation.js';
+import { chooseNext, modeOf, predict, queueOrder, sortQueue } from './rotation.js';
 import type {
+  BalanceKind,
   CallReason,
   DayRecord,
   Participant,
@@ -83,7 +85,6 @@ type Outcome = { ok: true } | { ok: false; error: string };
 const OK: Outcome = { ok: true };
 const fail = (error: string): Outcome => ({ ok: false, error });
 
-const STATE_LAST_ASSIGNED = 'last_assigned_id';
 const STATE_LAST_GENERATED = 'last_generated_date';
 const LINK_CODE_TTL_MS = 15 * 60_000;
 const LINK_CODE_MAX_ATTEMPTS = 5;
@@ -143,11 +144,6 @@ export class DutyService {
     return p.telegramUserId ? this.messenger.mention(p.telegramUserId, p.name) : escapeHtml(p.name);
   }
 
-  private lastAssignedId(): number | null {
-    const v = this.repo.getState(STATE_LAST_ASSIGNED);
-    return v ? Number(v) : null;
-  }
-
   private dayKeyboard(date: ISODate): Keyboard {
     return [
       [
@@ -159,8 +155,7 @@ export class DutyService {
   }
 
   private callKeyboard(date: ISODate): Keyboard {
-    const pts = this.settings().points.cover;
-    return [[{ text: `Eu pego (${pts > 0 ? '+' : ''}${pts})`, data: encodeButton({ type: 'eupego', date }) }]];
+    return [[{ text: 'Eu pego', data: encodeButton({ type: 'eupego', date }) }]];
   }
 
   private async say(html: string, opts: { buttons?: Keyboard; replyTo?: number | null } = {}): Promise<MessageRef | null> {
@@ -228,6 +223,92 @@ export class DutyService {
     return true;
   }
 
+  // ================= saldo de turnos =================
+
+  /**
+   * Soma `delta` ao saldo e registra na auditoria. Se a pessoa está de férias,
+   * o offset guardado acompanha (é ele que vale na volta). Chamar dentro de transação.
+   */
+  private changeBalance(id: number, delta: number, kind: BalanceKind, reason: string, actor: string, refDate?: ISODate): void {
+    const p = this.repo.getParticipant(id);
+    if (!p) return;
+    const after = p.balance + delta;
+    if (delta !== 0) this.repo.setBalance(id, after);
+    if (delta !== 0 && p.status === 'ferias' && p.vacationOffset !== null) {
+      this.repo.setVacationOffset(id, p.vacationOffset + delta);
+    }
+    this.repo.addBalanceLog({
+      participantId: id,
+      refDate: refDate ?? this.local().date,
+      delta,
+      balanceAfter: after,
+      kind,
+      reason,
+      actor,
+      createdAt: this.iso(),
+    });
+  }
+
+  /**
+   * Faz o +1 de saldo do dia ficar com quem efetivamente está com ele: o
+   * responsável atual, ou ninguém enquanto há chamada aberta / dia sem
+   * responsável. Idempotente (compara com `credited_id`), então reinícios e
+   * chamadas repetidas não duplicam; se o dia muda de mãos, o crédito é estornado
+   * de um e dado ao outro. Chamar dentro de transação, depois de mudar o dia.
+   */
+  private syncCredit(date: ISODate, actor: string): void {
+    const day = this.repo.getDay(date);
+    if (!day) return;
+    const want = day.status === 'chamada' ? null : day.holderId;
+    if (day.creditedId === want) return;
+    if (day.creditedId !== null) {
+      this.changeBalance(day.creditedId, -1, 'dia_estorno', `Deixou o dia ${date}`, actor, date);
+    }
+    if (want !== null) {
+      const reason = want === day.originalId ? `Dia ${date}` : `Cobriu ${this.name(day.callAbsenteeId)} em ${date}`;
+      this.changeBalance(want, 1, 'dia', reason, actor, date);
+    }
+    this.repo.updateDay(date, { creditedId: want });
+  }
+
+  /**
+   * Nivelamento: subtrai de todos os `ativo` a moda dos saldos dos ativos
+   * (empate de modas -> a menor). Registra sempre (mesmo com moda 0). Retorna a
+   * moda. Chamar dentro de transação.
+   */
+  private rebase(reason: string, actor: string): number {
+    const actives = this.participants().filter((p) => p.status === 'ativo');
+    const mode = modeOf(actives.map((p) => p.balance));
+    if (mode !== 0) {
+      for (const p of actives) this.changeBalance(p.id, -mode, 'nivelamento', `Nivelamento (${reason}): moda ${mode}`, actor);
+    }
+    this.repo.insertRebase({
+      ts: this.iso(),
+      refDate: this.local().date,
+      mode,
+      reason,
+      actor,
+      detail: actives.map((p) => ({ name: p.name, before: p.balance, after: p.balance - mode })),
+    });
+    this.repo.logEvent(this.iso(), 'nivelamento', { reason, mode });
+    return mode;
+  }
+
+  /** Nivelamento do início do mês (uma vez por mês, na primeira execução do tick). */
+  private maybeMonthlyRebase(today: ISODate): void {
+    const key = `rebase_month:${monthKey(today)}`;
+    this.repo.transaction(() => {
+      if (this.repo.getState(key)) return;
+      this.rebase(`início de ${monthLabel(monthKey(today))}`, 'mensal');
+      this.repo.setState(key, this.iso());
+    });
+  }
+
+  /** Ativos na ordem em que seriam escalados agora. */
+  queue(): Participant[] {
+    return queueOrder(this.participants(), this.repo.lastEffectiveDates());
+  }
+
   // ================= escala =================
 
   /**
@@ -246,10 +327,11 @@ export class DutyService {
     return this.repo.transaction(() => {
       const again = this.repo.getDay(date);
       if (again) return again;
-      const p = nextInQueue(this.participants(), this.lastAssignedId());
+      const p = chooseNext(this.participants(), this.repo.lastEffectiveDates());
       if (!p) return null;
       this.repo.insertDay(date, p.id);
-      this.repo.setState(STATE_LAST_ASSIGNED, String(p.id));
+      // Crédito já na atribuição: a previsão e a escala dos próximos dias consideram hoje.
+      this.syncCredit(date, 'escala');
       this.repo.setState(STATE_LAST_GENERATED, date);
       this.repo.logEvent(this.iso(), 'escala', { date, participant: p.name });
       return this.repo.getDay(date);
@@ -270,7 +352,7 @@ export class DutyService {
       if (rec) out.push({ date: d, record: rec, participant: byId.get(rec.holderId ?? rec.originalId) ?? null });
       else pending.push(d);
     }
-    const preds = predict(participants, this.lastAssignedId(), pending);
+    const preds = predict(participants, this.repo.lastEffectiveDates(), pending);
     for (const p of preds) out.push({ date: p.date, participant: p.participant, record: null });
     return out.sort((a, b) => a.date.localeCompare(b.date));
   }
@@ -299,11 +381,14 @@ export class DutyService {
     // 1. Fecha dias anteriores pendentes (bot pode ter ficado desligado).
     for (const d of this.repo.listUnfinalizedDaysBefore(today)) await this.closeDay(d.date, 'catch-up');
 
+    // 1b. Nivelamento do início do mês.
+    this.maybeMonthlyRebase(today);
+
     // 2. Aviso do dia.
     if (isActiveDay(today, s) && minutes >= announceAt && minutes < endAt) {
       const day = this.ensureDay(today);
       if (day && !day.announcedAt && day.status !== 'fechado' && this.messenger.isReady() && s.groupId) {
-        await this.maybePostMonthlyRanking(today);
+        await this.maybePostMonthlySummary(today);
         await this.announce(day);
       }
     }
@@ -346,22 +431,14 @@ export class DutyService {
     return true;
   }
 
-  private async maybePostMonthlyRanking(today: ISODate): Promise<void> {
+  /** No primeiro aviso do mês, resumo do mês anterior (dias recolhidos/coberturas). */
+  private async maybePostMonthlySummary(today: ISODate): Promise<void> {
     const month = monthKey(today);
     const prev = previousMonthKey(month);
-    const key = `ranking_posted:${prev}`;
+    const key = `summary_posted:${prev}`;
     if (this.repo.getState(key)) return;
-    if (this.repo.hasAnnouncedDayInMonth(month, today)) {
-      this.repo.setState(key, this.iso());
-      return;
-    }
-    const scores = this.repo.scores(prev);
-    if (scores.every((x) => x.month === 0)) {
-      this.repo.setState(key, this.iso());
-      return;
-    }
-    const text = msg.rankingText({ title: 'Ranking do mês passado', month: prev, scores, debts: [], showTotal: true });
-    if (await this.say(text)) this.repo.setState(key, this.iso());
+    const text = this.repo.hasAnnouncedDayInMonth(month, today) ? null : msg.monthSummaryText(prev, this.repo.dayStats(prev));
+    if (!text || (await this.say(text))) this.repo.setState(key, this.iso());
   }
 
   private async maybeSendReminder(date: ISODate): Promise<void> {
@@ -393,32 +470,17 @@ export class DutyService {
     }
   }
 
-  /** Fecha o dia e dá os pontos de quem ficou com ele. Idempotente. */
-  finalizeDay(date: ISODate, actor: string): { participantId: number; delta: number } | null {
-    const pts = this.settings().points;
+  /** Fecha o dia (o saldo já está com quem ficou com ele). Idempotente. Retorna se fechou agora. */
+  finalizeDay(date: ISODate, actor: string): boolean {
     return this.repo.transaction(() => {
       const day = this.repo.getDay(date);
-      if (!day || day.finalizedAt) return null;
-      let awarded: { participantId: number; delta: number } | null = null;
-      if (day.status !== 'chamada' && day.holderId !== null) {
-        const own = day.holderId === day.originalId;
-        const delta = own ? pts.ownTurn : pts.cover;
-        this.repo.addPoints({
-          participantId: day.holderId,
-          refDate: date,
-          delta,
-          kind: own ? 'turno' : 'cobertura',
-          reason: own ? 'Cumpriu o próprio turno' : `Cobriu ${this.name(day.callAbsenteeId)}`,
-          actor,
-          createdAt: this.iso(),
-        });
-        awarded = { participantId: day.holderId, delta };
-      } else {
-        this.repo.logEvent(this.iso(), 'dia_sem_responsavel', { date });
-      }
-      this.repo.updateDay(date, { status: 'fechado', finalizedAt: this.iso() });
-      this.repo.logEvent(this.iso(), 'dia_fechado', { date, actor, awarded });
-      return awarded;
+      if (!day || day.finalizedAt) return false;
+      const holder = day.status === 'chamada' ? null : day.holderId;
+      if (holder === null) this.repo.logEvent(this.iso(), 'dia_sem_responsavel', { date });
+      this.repo.updateDay(date, { status: 'fechado', holderId: holder, finalizedAt: this.iso() });
+      this.syncCredit(date, actor);
+      this.repo.logEvent(this.iso(), 'dia_fechado', { date, actor, holder: holder === null ? null : this.name(holder) });
+      return true;
     });
   }
 
@@ -458,7 +520,6 @@ export class DutyService {
 
   /** Abre chamada de cobertura. Retorna mensagem de erro (texto puro) ou null em caso de sucesso. */
   openCall(date: ISODate, reason: CallReason, actor: string): string | null {
-    const s = this.settings();
     return this.repo.transaction(() => {
       const day = this.repo.getDay(date);
       if (!day) return 'Hoje não tem recolhimento.';
@@ -466,16 +527,6 @@ export class DutyService {
       if (day.status === 'chamada') return `Já existe chamada aberta para cobrir ${this.name(day.callAbsenteeId)}.`;
       const absentee = day.holderId!;
       if (absentee !== day.originalId) this.repo.cancelActiveCoverageBy(date, absentee);
-      const delta = reason === 'naoposso' ? s.points.covered : s.points.reportedAbsence;
-      this.repo.addPoints({
-        participantId: absentee,
-        refDate: date,
-        delta,
-        kind: reason === 'naoposso' ? 'coberto' : 'falta',
-        reason: reason === 'naoposso' ? 'Avisou que não pode' : 'Falta reportada por colega',
-        actor,
-        createdAt: this.iso(),
-      });
       this.repo.updateDay(date, {
         status: 'chamada',
         holderId: null,
@@ -484,6 +535,7 @@ export class DutyService {
         callOpenedAt: this.iso(),
         callDeadline: this.computeDeadline(),
       });
+      this.syncCredit(date, actor);
       this.repo.logEvent(this.iso(), 'chamada_aberta', { date, reason, absentee: this.name(absentee), actor });
       return null;
     });
@@ -521,6 +573,7 @@ export class DutyService {
       reason: day.callReason!,
       createdAt: this.iso(),
     });
+    this.syncCredit(day.date, `cobertura ${mode}`);
     this.repo.logEvent(this.iso(), 'cobertura', {
       date: day.date,
       coverer: this.name(covererId),
@@ -530,11 +583,10 @@ export class DutyService {
   }
 
   async autoEscalate(date: ISODate): Promise<Participant | null> {
-    const s = this.settings();
     const chosen = this.repo.transaction(() => {
       const day = this.repo.getDay(date);
       if (!day || day.status !== 'chamada') return null;
-      const p = nextInQueue(this.participants(), day.originalId, this.excludedForDay(day));
+      const p = chooseNext(this.participants(), this.repo.lastEffectiveDates(), this.excludedForDay(day));
       if (!p) {
         // Ninguém disponível: deixa a chamada sem prazo para não repetir a cada minuto.
         this.repo.updateDay(date, { callDeadline: null });
@@ -554,7 +606,7 @@ export class DutyService {
     await this.safeEdit(this.callRef(day), msg.coveredNote({ holder: chosen.p.name, absentee, auto: true }));
     this.setCallRef(date, null);
     const ref = await this.say(
-      msg.autoEscalated({ holder: this.who(chosen.p), absentee, coverPoints: s.points.cover }),
+      msg.autoEscalated({ holder: this.who(chosen.p), absentee }),
       { buttons: this.dayKeyboard(date) },
     );
     this.setActionsRef(date, ref);
@@ -612,7 +664,7 @@ export class DutyService {
     await this.safeEdit(this.actionsRef(before), msg.callClosedNote({ date, absentee, reason, actor: sender.name }));
     this.setActionsRef(date, null);
     const ref = await this.say(
-      msg.callOpened({ absentee, coverPoints: this.settings().points.cover, deadline: day.callDeadline ?? '' }),
+      msg.callOpened({ absentee, deadline: day.callDeadline ?? '' }),
       { buttons: this.callKeyboard(date), replyTo: ctx.replyTo },
     );
     this.setCallRef(date, ref);
@@ -626,7 +678,7 @@ export class DutyService {
     await ctx.ack('Valeu! O dia é seu.');
     const day = this.repo.getDay(today)!;
     const absentee = this.name(day.callAbsenteeId);
-    const text = msg.claimed({ holder: this.who(sender), absentee, coverPoints: this.settings().points.cover });
+    const text = msg.claimed({ holder: this.who(sender), absentee });
     const call = this.callRef(day);
     if (ctx.viaButton && call && this.sameRef(call, ctx.source)) {
       // Clique no botão: a própria chamada vira o novo aviso, com os botões do dia.
@@ -649,17 +701,16 @@ export class DutyService {
     if (!day) return fail('Hoje não tem recolhimento.');
     if (day.status === 'fechado') return fail('O dia de hoje já foi encerrado. Valeu!');
     if (day.holderId !== sender.id) return fail(`Hoje o lixo está com ${this.name(day.holderId ?? day.callAbsenteeId)}.`);
-    const res = this.finalizeDay(today, `feito ${sender.name}`);
+    this.finalizeDay(today, `feito ${sender.name}`);
     this.repo.updateDay(today, { doneAt: this.iso() });
-    const delta = res ? res.delta : null;
-    await ctx.ack(`Registrado${delta !== null ? ` (${msg.fmtPts(delta)})` : ''}. Valeu!`);
+    await ctx.ack('Registrado. Valeu!');
     const after = this.repo.getDay(today);
-    await this.safeEdit(this.actionsRef(after), msg.doneNote({ date: today, holder: sender.name, delta }));
+    await this.safeEdit(this.actionsRef(after), msg.doneNote({ date: today, holder: sender.name }));
     await this.safeClear(this.callRef(after));
     this.setActionsRef(today, null);
     this.setCallRef(today, null);
     if (!ctx.viaButton) {
-      await this.say(`Valeu, ${escapeHtml(sender.name)}! Registrado${delta !== null ? ` (${msg.fmtPts(delta)})` : ''}.`, {
+      await this.say(`Valeu, ${escapeHtml(sender.name)}! Registrado.`, {
         replyTo: ctx.replyTo,
       });
     }
@@ -878,8 +929,8 @@ export class DutyService {
       case 'escala':
         if (this.cooledDown('escala')) await this.say(this.escalaText());
         return;
-      case 'ranking':
-        if (this.cooledDown('ranking')) await this.say(this.rankingText());
+      case 'saldo':
+        if (this.cooledDown('saldo')) await this.say(this.saldoText());
         return;
       case 'hoje':
         if (this.cooledDown('hoje')) await this.say(this.hojeText());
@@ -972,11 +1023,10 @@ export class DutyService {
       const who = u.record?.status === 'chamada' ? '?' : escapeHtml(u.participant?.name ?? '?');
       return `${formatShort(u.date)}: ${who}${suffix}`;
     });
-    return lines.length ? `<b>Escala</b>\n${lines.join('\n')}` : 'Nenhum dia ativo configurado.';
+    return lines.length ? `<b>Escala</b>\n${lines.join('\n')}\n\n${msg.QUEUE_RULE}` : 'Nenhum dia ativo configurado.';
   }
 
   hojeText(): string {
-    const s = this.settings();
     const today = this.local().date;
     const n = (id: number | null) => escapeHtml(this.name(id));
     const day = this.todayIfActive();
@@ -985,32 +1035,35 @@ export class DutyService {
       return `Hoje não tem recolhimento.${next?.participant ? ` Próximo: ${formatShort(next.date)} com ${escapeHtml(next.participant.name)}.` : ''}`;
     }
     if (day.status === 'chamada') {
-      return `Hoje: procurando quem cubra ${n(day.callAbsenteeId)}. Toque em <b>Eu pego</b> ou use /eupego (vale ${msg.fmtPts(s.points.cover)}).`;
+      return `Hoje: procurando quem cubra ${n(day.callAbsenteeId)}. Toque em <b>Eu pego</b> ou use /eupego (cobrir adianta sua folga).`;
     }
     const cover = day.holderId !== day.originalId ? ` (cobrindo ${n(day.callAbsenteeId)})` : '';
     const done = day.status === 'fechado' ? ' Já foi feito.' : '';
     return `Hoje (${formatShort(today)}) o lixo é com ${n(day.holderId)}${cover}.${done}`;
   }
 
-  rankingText(): string {
+  saldoText(): string {
     const month = monthKey(this.local().date);
-    return msg.rankingText({
-      title: 'Ranking',
-      month,
-      scores: this.repo.scores(month),
-      debts: this.repo.debts(),
-      showTotal: true,
-    });
+    const stats = this.repo.dayStats(month);
+    const byId = new Map(stats.map((x) => [x.participantId, x]));
+    const queue = this.queue().map((p) => byId.get(p.id)!);
+    return msg.saldoText({ month, queue, stats });
   }
 
   // ================= admin =================
 
-  addParticipant(name: string): Participant {
+  /** Novo participante: nivela os ativos atuais e entra com saldo 0. */
+  addParticipant(name: string, actor = 'admin'): Participant {
     const clean = name.trim();
     if (!clean || clean.length > 40) throw new Error('Nome inválido');
-    const p = this.repo.addParticipant(clean);
-    this.repo.logEvent(this.iso(), 'admin_participante_add', { name: clean });
-    return p;
+    return this.repo.transaction(() => {
+      if (this.participants().some((p) => sameName(p.name, clean))) throw new Error('Já existe alguém com esse nome');
+      this.rebase(`entrada de ${clean}`, actor);
+      const p = this.repo.addParticipant(clean);
+      this.changeBalance(p.id, 0, 'entrada', 'Entrou na escala com saldo 0', actor);
+      this.repo.logEvent(this.iso(), 'admin_participante_add', { name: clean });
+      return this.repo.getParticipant(p.id)!;
+    });
   }
 
   renameParticipant(id: number, name: string): void {
@@ -1020,9 +1073,51 @@ export class DutyService {
     this.repo.logEvent(this.iso(), 'admin_participante_renomear', { id, name: clean });
   }
 
-  setStatus(id: number, status: ParticipantStatus): void {
-    this.repo.setParticipantStatus(id, status);
-    this.repo.logEvent(this.iso(), 'admin_status', { id, name: this.name(id), status });
+  /**
+   * Muda o status aplicando as regras de saldo:
+   * - ativo -> férias: guarda offset = saldo - moda dos ativos (incluindo a pessoa);
+   * - férias -> ativo: nivela os ativos e o saldo vira o offset guardado;
+   * - desligado -> ativo: nivela os ativos e entra com saldo 0;
+   * - férias -> desligado: descarta o offset.
+   */
+  setStatus(id: number, status: ParticipantStatus, actor = 'admin'): void {
+    this.repo.transaction(() => {
+      const p = this.repo.getParticipant(id);
+      if (!p) throw new Error('Participante inválido');
+      const from = p.status;
+      if (from === status) return;
+      if (status === 'ativo') {
+        this.rebase(from === 'ferias' ? `volta de férias de ${p.name}` : `volta de ${p.name}`, actor);
+        const target = from === 'ferias' ? (p.vacationOffset ?? 0) : 0;
+        this.repo.setParticipantStatus(id, 'ativo');
+        this.repo.setVacationOffset(id, null);
+        this.changeBalance(
+          id,
+          target - p.balance,
+          from === 'ferias' ? 'ferias_volta' : 'reativacao',
+          from === 'ferias' ? `Voltou de férias: saldo = offset guardado (${target})` : 'Voltou à escala com saldo 0',
+          actor,
+        );
+      } else if (status === 'ferias') {
+        let offset = 0;
+        let reason = 'Férias (vindo de desligado): offset 0';
+        if (from === 'ativo') {
+          const mode = modeOf(this.participants().filter((x) => x.status === 'ativo').map((x) => x.balance));
+          offset = p.balance - mode;
+          reason = `Saiu de férias: saldo ${p.balance}, moda ${mode}, offset guardado ${offset}`;
+        }
+        this.repo.setParticipantStatus(id, 'ferias');
+        this.repo.setVacationOffset(id, offset);
+        this.changeBalance(id, 0, 'ferias_saida', reason, actor);
+      } else {
+        if (from === 'ferias') {
+          this.changeBalance(id, 0, 'ferias_descartado', `Desligado: offset ${p.vacationOffset ?? 0} descartado`, actor);
+        }
+        this.repo.setParticipantStatus(id, 'desligado');
+        this.repo.setVacationOffset(id, null);
+      }
+      this.repo.logEvent(this.iso(), 'admin_status', { id, name: p.name, from, status });
+    });
   }
 
   move(id: number, dir: -1 | 1): void {
@@ -1050,19 +1145,19 @@ export class DutyService {
     });
   }
 
-  adjustPoints(participantId: number, delta: number, reason: string, actor: string): void {
-    if (!Number.isInteger(delta) || delta === 0) throw new Error('Valor inválido');
-    if (!reason.trim()) throw new Error('Informe o motivo');
-    this.repo.addPoints({
-      participantId,
-      refDate: this.local().date,
-      delta,
-      kind: 'ajuste',
-      reason: reason.trim().slice(0, 200),
-      actor,
-      createdAt: this.iso(),
+  /** Ajuste manual de saldo, com motivo (para quem está de férias, ajusta o offset guardado). */
+  adjustBalance(participantId: number, delta: number, reason: string, actor: string): void {
+    if (!Number.isInteger(delta) || delta === 0 || Math.abs(delta) > 100) throw new Error('Valor inválido');
+    const why = reason.trim().slice(0, 200);
+    if (!why) throw new Error('Informe o motivo');
+    this.repo.transaction(() => {
+      const p = this.repo.getParticipant(participantId);
+      if (!p) throw new Error('Participante inválido');
+      if (p.status === 'desligado') throw new Error('Desligado não tem saldo (volta com 0)');
+      if (p.status === 'ferias' && p.vacationOffset === null) this.repo.setVacationOffset(p.id, 0);
+      this.changeBalance(participantId, delta, 'ajuste', why, actor);
+      this.repo.logEvent(this.iso(), 'admin_ajuste_saldo', { participant: p.name, delta, reason: why, actor });
     });
-    this.repo.logEvent(this.iso(), 'admin_ajuste_pontos', { participant: this.name(participantId), delta, reason, actor });
   }
 
   updateSettings(partial: Partial<Settings>): void {
@@ -1079,20 +1174,18 @@ export class DutyService {
     const refs = this.repo.transaction(() => {
       const day = this.repo.getDay(date);
       if (!day) throw new Error('Dia não existe');
-      if (day.finalizedAt) throw new Error('Dia já fechado; use ajuste de pontos');
+      if (day.finalizedAt) throw new Error('Dia já fechado; use ajuste de saldo');
       if (this.repo.getState(STATE_LAST_GENERATED) !== date) throw new Error('Só é possível desfazer o último dia gerado');
       const prev = this.repo.db
-        .prepare('SELECT date, original_id FROM days WHERE date < ? ORDER BY date DESC LIMIT 1')
-        .get(date) as { date: string; original_id: number } | undefined;
-      this.repo.db.prepare("DELETE FROM points WHERE ref_date = ? AND kind IN ('coberto','falta')").run(date);
+        .prepare('SELECT date FROM days WHERE date < ? ORDER BY date DESC LIMIT 1')
+        .get(date) as { date: string } | undefined;
+      if (day.creditedId !== null) {
+        this.changeBalance(day.creditedId, -1, 'dia_estorno', `Dia ${date} desfeito`, 'admin', date);
+      }
       this.repo.db.prepare('DELETE FROM coverages WHERE date = ?').run(date);
       this.repo.db.prepare('DELETE FROM days WHERE date = ?').run(date);
-      if (prev) {
-        this.repo.setState(STATE_LAST_ASSIGNED, String(prev.original_id));
-        this.repo.setState(STATE_LAST_GENERATED, prev.date);
-      } else {
-        this.repo.db.prepare('DELETE FROM state WHERE key IN (?, ?)').run(STATE_LAST_ASSIGNED, STATE_LAST_GENERATED);
-      }
+      if (prev) this.repo.setState(STATE_LAST_GENERATED, prev.date);
+      else this.repo.db.prepare('DELETE FROM state WHERE key = ?').run(STATE_LAST_GENERATED);
       // Marca a data como sem recolhimento, para não ser regerada.
       const s = this.settings();
       if (!s.holidays.includes(date)) this.repo.saveSettings({ holidays: [...s.holidays, date].sort() });

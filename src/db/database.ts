@@ -1,5 +1,6 @@
 import Database from 'better-sqlite3';
 import type { Database as DB } from 'better-sqlite3';
+import { modeOf } from '../domain/rotation.js';
 
 export const SEED_PARTICIPANTS = [
   'Richard',
@@ -13,7 +14,10 @@ export const SEED_PARTICIPANTS = [
   'Vidal',
 ];
 
-const MIGRATIONS: string[] = [
+/** SQL puro ou função (quando a migração precisa de lógica). Roda dentro de transação. */
+type Migration = string | ((db: DB) => void);
+
+const MIGRATIONS: Migration[] = [
   `
   CREATE TABLE participants (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,7 +112,85 @@ const MIGRATIONS: string[] = [
 
   DELETE FROM settings WHERE key IN ('groupId', 'groupName');
   `,
+  // v3: fila por saldo de turnos (substitui o ponteiro round-robin) e fim dos
+  // pontos de reconhecimento. Dias e coberturas são preservados.
+  migrateToBalance,
 ];
+
+/**
+ * v3. Saldo inicial = dias que cada um efetivamente ficou (holder de dia que não
+ * está em chamada), seguido de um nivelamento pela moda dos ativos. Quem está de
+ * férias guarda offset = saldo - moda dos ativos. Tabela/config de pontos sai.
+ */
+function migrateToBalance(db: DB): void {
+  db.exec(`
+  ALTER TABLE participants ADD COLUMN balance INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE participants ADD COLUMN vacation_offset INTEGER;
+  ALTER TABLE days ADD COLUMN credited_id INTEGER REFERENCES participants(id);
+  CREATE INDEX idx_days_credited ON days(credited_id);
+
+  CREATE TABLE balance_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    participant_id INTEGER NOT NULL REFERENCES participants(id),
+    ref_date TEXT NOT NULL,
+    delta INTEGER NOT NULL,
+    balance_after INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX idx_balance_log_participant ON balance_log(participant_id);
+
+  CREATE TABLE rebases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    ref_date TEXT NOT NULL,
+    mode INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    detail TEXT NOT NULL
+  );
+
+  UPDATE days SET credited_id = CASE WHEN status = 'chamada' THEN NULL ELSE holder_id END;
+
+  DROP TABLE points;
+  DELETE FROM settings WHERE key = 'points';
+  DELETE FROM state WHERE key = 'last_assigned_id' OR key LIKE 'ranking_posted:%';
+  `);
+
+  const ts = new Date().toISOString();
+  const refDate = ts.slice(0, 10);
+  const people = db
+    .prepare(
+      `SELECT p.id, p.name, p.status,
+              (SELECT COUNT(*) FROM days d WHERE d.credited_id = p.id) AS days
+         FROM participants p ORDER BY p.position, p.id`,
+    )
+    .all() as { id: number; name: string; status: string; days: number }[];
+  const mode = modeOf(people.filter((p) => p.status === 'ativo').map((p) => p.days));
+
+  const setBal = db.prepare('UPDATE participants SET balance = ?, vacation_offset = ? WHERE id = ?');
+  const log = db.prepare(
+    `INSERT INTO balance_log (participant_id, ref_date, delta, balance_after, kind, reason, actor, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 'migracao', ?)`,
+  );
+  const detail: { name: string; before: number; after: number }[] = [];
+  for (const p of people) {
+    if (p.days !== 0) log.run(p.id, refDate, p.days, p.days, 'migracao', `Saldo inicial: ${p.days} dia(s) já recolhido(s)`, ts);
+    if (p.status === 'ativo') {
+      setBal.run(p.days - mode, null, p.id);
+      detail.push({ name: p.name, before: p.days, after: p.days - mode });
+      if (mode !== 0) log.run(p.id, refDate, -mode, p.days - mode, 'nivelamento', `Nivelamento (migração): moda ${mode}`, ts);
+    } else {
+      // Férias: guarda a distância para a moda; desligado: saldo irrelevante (volta com 0).
+      setBal.run(p.days, p.status === 'ferias' ? p.days - mode : null, p.id);
+    }
+  }
+  db.prepare(
+    "INSERT INTO rebases (ts, ref_date, mode, reason, actor, detail) VALUES (?, ?, ?, 'migração para saldo de turnos', 'migracao', ?)",
+  ).run(ts, refDate, mode, JSON.stringify(detail));
+}
 
 export function openDatabase(file: string): DB {
   const db = new Database(file);
@@ -132,7 +214,9 @@ function migrate(db: DB, file: string): void {
   try {
     for (let v = version; v < MIGRATIONS.length; v++) {
       db.transaction(() => {
-        db.exec(MIGRATIONS[v]!);
+        const m = MIGRATIONS[v]!;
+        if (typeof m === 'string') db.exec(m);
+        else m(db);
         const broken = db.pragma('foreign_key_check') as unknown[];
         if (broken.length > 0) throw new Error(`migração v${v + 1} quebrou chaves estrangeiras`);
         db.pragma(`user_version = ${v + 1}`);

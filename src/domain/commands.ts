@@ -11,7 +11,7 @@ export type Command =
   | { type: 'ajuda' }
   | { type: 'hoje' }
   | { type: 'escala' }
-  | { type: 'ranking' }
+  | { type: 'saldo' }
   | { type: 'feito' }
   | { type: 'sou'; name: string }
   | { type: 'naoposso'; natural: boolean }
@@ -23,7 +23,7 @@ export type Command =
 export const GROUP_COMMANDS: { command: string; description: string }[] = [
   { command: 'hoje', description: 'Quem está com o lixo hoje' },
   { command: 'escala', description: 'Próximos dias' },
-  { command: 'ranking', description: 'Placar do mês e total' },
+  { command: 'saldo', description: 'Saldo de turnos (fila) e dias recolhidos' },
   { command: 'naoposso', description: 'O escalado avisa que não pode' },
   { command: 'faltou', description: 'Avisa que o escalado faltou/esqueceu' },
   { command: 'eupego', description: 'Assume o dia de quem não pode' },
@@ -76,9 +76,10 @@ export function parseCommand(raw: string, botUsername: string | null = null): Co
         return { type: 'hoje' };
       case 'escala':
         return { type: 'escala' };
+      case 'saldo':
       case 'ranking':
       case 'placar':
-        return { type: 'ranking' };
+        return { type: 'saldo' };
       case 'feito':
         return { type: 'feito' };
       case 'sou':

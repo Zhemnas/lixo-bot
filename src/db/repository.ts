@@ -7,9 +7,10 @@ import {
   type DayRecord,
   type DayStatus,
   type Participant,
+  type BalanceEntry,
+  type BalanceKind,
   type ParticipantStatus,
-  type PointEntry,
-  type PointKind,
+  type RebaseRecord,
   type Settings,
 } from '../domain/types.js';
 
@@ -21,6 +22,8 @@ interface ParticipantRow {
   telegram_user_id: string | null;
   telegram_username: string | null;
   telegram_name: string | null;
+  balance: number;
+  vacation_offset: number | null;
 }
 
 interface DayRow {
@@ -39,6 +42,7 @@ interface DayRow {
   actions_message_id: number | null;
   call_chat_id: string | null;
   call_message_id: number | null;
+  credited_id: number | null;
 }
 
 interface CoverageRow {
@@ -52,15 +56,26 @@ interface CoverageRow {
   created_at: string;
 }
 
-interface PointRow {
+interface BalanceRow {
   id: number;
   participant_id: number;
   ref_date: string;
   delta: number;
-  kind: PointKind;
+  balance_after: number;
+  kind: BalanceKind;
   reason: string;
   actor: string;
   created_at: string;
+}
+
+interface RebaseRow {
+  id: number;
+  ts: string;
+  ref_date: string;
+  mode: number;
+  reason: string;
+  actor: string;
+  detail: string;
 }
 
 const toParticipant = (r: ParticipantRow): Participant => ({
@@ -71,6 +86,8 @@ const toParticipant = (r: ParticipantRow): Participant => ({
   telegramUserId: r.telegram_user_id,
   telegramUsername: r.telegram_username,
   telegramName: r.telegram_name,
+  balance: r.balance,
+  vacationOffset: r.vacation_offset,
 });
 
 const toDay = (r: DayRow): DayRecord => ({
@@ -89,6 +106,7 @@ const toDay = (r: DayRow): DayRecord => ({
   actionsMessageId: r.actions_message_id,
   callChatId: r.call_chat_id,
   callMessageId: r.call_message_id,
+  creditedId: r.credited_id,
 });
 
 const toCoverage = (r: CoverageRow): Coverage => ({
@@ -102,23 +120,40 @@ const toCoverage = (r: CoverageRow): Coverage => ({
   createdAt: r.created_at,
 });
 
-const toPoint = (r: PointRow): PointEntry => ({
+const toBalance = (r: BalanceRow): BalanceEntry => ({
   id: r.id,
   participantId: r.participant_id,
   refDate: r.ref_date,
   delta: r.delta,
+  balanceAfter: r.balance_after,
   kind: r.kind,
   reason: r.reason,
   actor: r.actor,
   createdAt: r.created_at,
 });
 
-export interface ScoreRow {
+const toRebase = (r: RebaseRow): RebaseRecord => ({
+  id: r.id,
+  ts: r.ts,
+  refDate: r.ref_date,
+  mode: r.mode,
+  reason: r.reason,
+  actor: r.actor,
+  detail: JSON.parse(r.detail) as RebaseRecord['detail'],
+});
+
+/** Estatística derivada da tabela de dias (só dias já fechados com responsável). */
+export interface DayStatsRow {
   participantId: number;
   name: string;
   status: ParticipantStatus;
-  month: number;
-  total: number;
+  balance: number;
+  /** dias recolhidos (próprios + coberturas) */
+  days: number;
+  /** coberturas feitas */
+  covers: number;
+  monthDays: number;
+  monthCovers: number;
 }
 
 export interface DebtRow {
@@ -150,9 +185,7 @@ export class Repository {
     for (const { key, value } of rows) {
       if (key in s) s[key] = JSON.parse(value);
     }
-    const settings = s as unknown as Settings;
-    settings.points = { ...DEFAULT_SETTINGS.points, ...settings.points };
-    return settings;
+    return s as unknown as Settings;
   }
 
   saveSettings(partial: Partial<Settings>): void {
@@ -219,6 +252,14 @@ export class Repository {
     this.db.prepare('UPDATE participants SET status = ? WHERE id = ?').run(status, id);
   }
 
+  setBalance(id: number, balance: number): void {
+    this.db.prepare('UPDATE participants SET balance = ? WHERE id = ?').run(balance, id);
+  }
+
+  setVacationOffset(id: number, offset: number | null): void {
+    this.db.prepare('UPDATE participants SET vacation_offset = ? WHERE id = ?').run(offset, id);
+  }
+
   renameParticipant(id: number, name: string): void {
     this.db.prepare('UPDATE participants SET name = ? WHERE id = ?').run(name, id);
   }
@@ -270,6 +311,7 @@ export class Repository {
       actionsMessageId: 'actions_message_id',
       callChatId: 'call_chat_id',
       callMessageId: 'call_message_id',
+      creditedId: 'credited_id',
     };
     const entries = Object.entries(patch).filter(([, v]) => v !== undefined);
     if (entries.length === 0) return;
@@ -291,6 +333,14 @@ export class Repository {
     return (
       this.db.prepare('SELECT * FROM days ORDER BY date DESC LIMIT ?').all(limit) as DayRow[]
     ).map(toDay);
+  }
+
+  /** Último dia efetivo (creditado) de cada participante. */
+  lastEffectiveDates(): Map<number, string> {
+    const rows = this.db
+      .prepare('SELECT credited_id AS id, MAX(date) AS d FROM days WHERE credited_id IS NOT NULL GROUP BY credited_id')
+      .all() as { id: number; d: string }[];
+    return new Map(rows.map((r) => [r.id, r.d]));
   }
 
   hasAnnouncedDayInMonth(month: string, beforeDate: string): boolean {
@@ -350,33 +400,48 @@ export class Repository {
       .all() as DebtRow[];
   }
 
-  // ---------- points ----------
-  addPoints(e: Omit<PointEntry, 'id'>): void {
+  // ---------- saldo ----------
+  addBalanceLog(e: Omit<BalanceEntry, 'id'>): void {
     this.db
       .prepare(
-        'INSERT INTO points (participant_id, ref_date, delta, kind, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO balance_log (participant_id, ref_date, delta, balance_after, kind, reason, actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(e.participantId, e.refDate, e.delta, e.kind, e.reason, e.actor, e.createdAt);
+      .run(e.participantId, e.refDate, e.delta, e.balanceAfter, e.kind, e.reason, e.actor, e.createdAt);
   }
 
-  listPoints(limit: number): PointEntry[] {
+  listBalanceLog(limit: number): BalanceEntry[] {
     return (
-      this.db.prepare('SELECT * FROM points ORDER BY id DESC LIMIT ?').all(limit) as PointRow[]
-    ).map(toPoint);
+      this.db.prepare('SELECT * FROM balance_log ORDER BY id DESC LIMIT ?').all(limit) as BalanceRow[]
+    ).map(toBalance);
   }
 
-  scores(month: string): ScoreRow[] {
+  insertRebase(r: Omit<RebaseRecord, 'id'>): void {
+    this.db
+      .prepare('INSERT INTO rebases (ts, ref_date, mode, reason, actor, detail) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(r.ts, r.refDate, r.mode, r.reason, r.actor, JSON.stringify(r.detail));
+  }
+
+  listRebases(limit: number): RebaseRecord[] {
+    return (
+      this.db.prepare('SELECT * FROM rebases ORDER BY id DESC LIMIT ?').all(limit) as RebaseRow[]
+    ).map(toRebase);
+  }
+
+  /** Dias recolhidos e coberturas feitas por pessoa (total e no mês `month`). */
+  dayStats(month: string): DayStatsRow[] {
     return this.db
       .prepare(
-        `SELECT p.id AS participantId, p.name, p.status,
-                COALESCE(SUM(CASE WHEN substr(x.ref_date,1,7) = ? THEN x.delta END), 0) AS month,
-                COALESCE(SUM(x.delta), 0) AS total
+        `SELECT p.id AS participantId, p.name, p.status, p.balance,
+                COUNT(d.date) AS days,
+                COALESCE(SUM(d.credited_id <> d.original_id), 0) AS covers,
+                COALESCE(SUM(substr(d.date,1,7) = ?), 0) AS monthDays,
+                COALESCE(SUM(substr(d.date,1,7) = ? AND d.credited_id <> d.original_id), 0) AS monthCovers
            FROM participants p
-           LEFT JOIN points x ON x.participant_id = p.id
+           LEFT JOIN days d ON d.credited_id = p.id AND d.status = 'fechado'
           GROUP BY p.id
-          ORDER BY month DESC, total DESC, p.position`,
+          ORDER BY p.position, p.id`,
       )
-      .all(month) as ScoreRow[];
+      .all(month, month) as DayStatsRow[];
   }
 
   // ---------- events ----------
